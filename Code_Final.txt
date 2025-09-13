@@ -1,0 +1,445 @@
+# DRE Project
+# Author: Sajib Sarker
+# Affiliation: Lecturer, Dept. of URP, CUET, sajibsarker@cuet.ac.bd
+
+
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.svm import SVC, SVR
+from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (accuracy_score, f1_score, classification_report, confusion_matrix,
+                             mean_squared_error, mean_absolute_error, r2_score)
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import re
+import warnings
+warnings.filterwarnings('ignore')
+
+# Optional powerful libraries (use pip in Colab if not installed)
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
+
+try:
+    import lightgbm as lgb
+except Exception:
+    lgb = None
+
+
+# Paths
+
+# In Colab: mount drive and use this path
+DRIVE_MOUNT_POINT = '/content/drive'
+EXCEL_PATH = os.path.join(DRIVE_MOUNT_POINT, 'MyDrive', 'Papers', 'DRE', 'DRE_UHI', 'Prediction', 'Prediction.xlsx')
+# Set the output directory to the same directory as the input Excel file
+OUTPUT_DIR = os.path.dirname(EXCEL_PATH)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# Helpers: plotting functions
+
+
+def plot_model_comparison(metrics_df, metric_name, title):
+    plt.figure(figsize=(8,5))
+    sns.barplot(x='model', y=metric_name, data=metrics_df)
+    plt.title(title)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f'model_comparison_{metric_name}.png'))
+    plt.show()
+
+
+def plot_confusion_matrix(y_true, y_pred, classes, title, fname):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt='d', xticklabels=classes, yticklabels=classes)
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, fname))
+    plt.show()
+
+
+def plot_regression_results(y_true, y_pred, title, fname):
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_true, y_pred, alpha=0.5)
+    mn = min(min(y_true), min(y_pred))
+    mx = max(max(y_true), max(y_pred))
+    plt.plot([mn,mx],[mn,mx], linestyle='--')
+    plt.xlabel('Actual')
+    plt.ylabel('Predicted')
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, fname))
+    plt.show()
+
+
+# Load data (mount drive in Colab)
+
+print('If running in Colab, you will need to mount Google Drive.\n')
+try:
+    from google.colab import drive
+    # Attempt to mount Google Drive if not already mounted
+    if not os.path.exists(DRIVE_MOUNT_POINT) or not os.path.ismount(DRIVE_MOUNT_POINT):
+        drive.mount(DRIVE_MOUNT_POINT)
+    else:
+        print('Google Drive is already mounted.')
+
+except Exception:
+    print('Not running in Colab or google.colab is unavailable. Make sure the path to file is correct.')
+
+print('Reading Excel from:', EXCEL_PATH)
+df = pd.read_excel(EXCEL_PATH)
+print('Loaded dataframe with shape:', df.shape)
+
+
+# Data preparation - FIXED
+
+# Define columns
+lulc_years = [2005, 2009, 2013, 2017, 2021, 2025]
+lst_years = [2005, 2009, 2013, 2017, 2021, 2025]
+
+lulc_cols = [f'lulc_{y}' for y in lulc_years]
+lst_cols = [f'lst_{y}' for y in lst_years]
+
+required_cols = ['FID'] + lulc_cols + lst_cols
+for c in required_cols:
+    if c not in df.columns:
+        raise ValueError(f'Missing required column: {c}')
+
+# Keep FID
+fids = df['FID'].values
+
+# Create feature matrix using years up to 2021
+feature_lulc_cols = [f'lulc_{y}' for y in [2005, 2009, 2013, 2017, 2021]]
+feature_lst_cols = [f'lst_{y}' for y in [2005, 2009, 2013, 2017, 2021]]
+
+# Targets: 2025
+y_lulc = df['lulc_2025'].astype(int)
+y_lst = df['lst_2025'].astype(float)
+
+# Create proper time series features
+def prepare_time_series_features(df, feature_cols, target_col):
+    X = []
+    y = []
+    fid_list = []
+
+    for fid in df['FID'].unique():
+        fid_data = df[df['FID'] == fid]
+
+        # Check if we have complete time series data
+        if not fid_data[feature_cols].isnull().any().any() and not fid_data[target_col].isnull().any():
+            X.append(fid_data[feature_cols].values.flatten())
+            y.append(fid_data[target_col].values[0])
+            fid_list.append(fid)
+
+    return np.array(X), np.array(y), np.array(fid_list)
+
+# Prepare LULC data
+X_lulc, y_lulc, fid_lulc = prepare_time_series_features(df, feature_lulc_cols, 'lulc_2025')
+
+# Prepare LST data
+X_lst, y_lst, fid_lst = prepare_time_series_features(df, feature_lst_cols, 'lst_2025')
+
+# Split data into train and test sets
+X_lulc_train, X_lulc_test, y_lulc_train, y_lulc_test = train_test_split(
+    X_lulc, y_lulc, test_size=0.2, random_state=42, stratify=y_lulc
+)
+
+X_lst_train, X_lst_test, y_lst_train, y_lst_test = train_test_split(
+    X_lst, y_lst, test_size=0.2, random_state=42
+)
+
+# Scale LST data (important for regression models)
+scaler_lst = StandardScaler()
+X_lst_train_scaled = scaler_lst.fit_transform(X_lst_train)
+X_lst_test_scaled = scaler_lst.transform(X_lst_test)
+
+# Scale LULC data (some models benefit from scaling)
+scaler_lulc = StandardScaler()
+X_lulc_train_scaled = scaler_lulc.fit_transform(X_lulc_train)
+X_lulc_test_scaled = scaler_lulc.transform(X_lulc_test)
+
+print('LULC training data shape:', X_lulc_train.shape)
+print('LULC test data shape:', X_lulc_test.shape)
+print('LST training data shape:', X_lst_train.shape)
+print('LST test data shape:', X_lst_test.shape)
+
+
+# Define models to compare
+
+# Classification models for LULC
+clf_models = {
+    'RandomForest': RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1),
+    'SVM': SVC(probability=True, random_state=42),
+    'MLP': MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42),
+}
+if xgb is not None:
+    clf_models['XGBoost'] = xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42)
+if lgb is not None:
+    clf_models['LightGBM'] = lgb.LGBMClassifier(random_state=42)
+
+# Regression models for LST
+reg_models = {
+    'RandomForest': RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+    'SVR': SVR(),
+    'MLP': MLPRegressor(hidden_layer_sizes=(100,), max_iter=500, random_state=42)
+}
+if xgb is not None:
+    reg_models['XGBoost'] = xgb.XGBRegressor(random_state=42)
+if lgb is not None:
+    reg_models['LightGBM'] = lgb.LGBMRegressor(random_state=42)
+
+
+
+# Train on years up to 2021, test on 2025 - FIXED
+
+clf_metrics = []
+reg_metrics = []
+
+print("Evaluating LULC models:")
+print("=" * 50)
+
+for name, model in clf_models.items():
+    print(f'\nTraining classifier: {name}')
+
+    # Use scaled data for SVM and MLP
+    if name in ['SVM', 'MLP']:
+        model.fit(X_lulc_train_scaled, y_lulc_train)
+        preds = model.predict(X_lulc_test_scaled)
+    else:
+        model.fit(X_lulc_train, y_lulc_train)
+        preds = model.predict(X_lulc_test)
+
+    acc = accuracy_score(y_lulc_test, preds)
+    f1 = f1_score(y_lulc_test, preds, average='weighted')
+    clf_metrics.append({'model': name, 'accuracy': acc, 'f1_weighted': f1})
+    print(f'Accuracy: {acc:.4f}, F1-weighted: {f1:.4f}')
+
+    # save model
+    joblib.dump(model, os.path.join(OUTPUT_DIR, f'clf_{name}.joblib'))
+
+    # confusion matrix
+    plot_confusion_matrix(y_lulc_test, preds, classes=[0,1,2,3],
+                         title=f'Confusion Matrix - {name}', fname=f'confmat_clf_{name}.png')
+
+# Convert to DataFrame
+clf_metrics_df = pd.DataFrame(clf_metrics)
+print('\nClassifier metrics:\n', clf_metrics_df)
+plot_model_comparison(clf_metrics_df, 'accuracy', 'Classifier Accuracy Comparison')
+plot_model_comparison(clf_metrics_df, 'f1_weighted', 'Classifier F1-weighted Comparison')
+
+print("\nEvaluating LST models:")
+print("=" * 50)
+
+for name, model in reg_models.items():
+    print(f'\nTraining regressor: {name}')
+
+    # Use scaled data for SVR and MLP
+    if name in ['SVR', 'MLP']:
+        model.fit(X_lst_train_scaled, y_lst_train)
+        preds = model.predict(X_lst_test_scaled)
+    else:
+        model.fit(X_lst_train, y_lst_train)
+        preds = model.predict(X_lst_test)
+
+    rmse = mean_squared_error(y_lst_test, preds)
+    mae = mean_absolute_error(y_lst_test, preds)
+    r2 = r2_score(y_lst_test, preds)
+    reg_metrics.append({'model': name, 'rmse': rmse, 'mae': mae, 'r2': r2})
+    print(f'RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}')
+
+    joblib.dump(model, os.path.join(OUTPUT_DIR, f'reg_{name}.joblib'))
+    plot_regression_results(y_lst_test, preds, f'Regression Actual vs Predicted - {name}',
+                           fname=f'reg_scatter_{name}.png')
+
+reg_metrics_df = pd.DataFrame(reg_metrics)
+print('\nRegression metrics:\n', reg_metrics_df)
+plot_model_comparison(reg_metrics_df, 'rmse', 'Regressor RMSE Comparison')
+plot_model_comparison(reg_metrics_df, 'r2', 'Regressor R2 Comparison')
+
+# Save model comparison metrics to Excel
+clf_metrics_out = os.path.join(OUTPUT_DIR, 'LULC_model_comparison_metrics.xlsx')
+clf_metrics_df.to_excel(clf_metrics_out, index=False)
+print(f'\nSaved LULC model comparison metrics to: {clf_metrics_out}')
+
+reg_metrics_out = os.path.join(OUTPUT_DIR, 'LST_model_comparison_metrics.xlsx')
+reg_metrics_df.to_excel(reg_metrics_out, index=False)
+print(f'Saved LST model comparison metrics to: {reg_metrics_out}')
+
+
+
+# Choose best models
+
+best_clf_name = clf_metrics_df.sort_values('f1_weighted', ascending=False).iloc[0]['model']
+best_reg_name = reg_metrics_df.sort_values('rmse', ascending=True).iloc[0]['model']
+print(f'\nBest classifier by F1-weighted: {best_clf_name}')
+print(f'Best regressor by RMSE: {best_reg_name}')
+
+# Retrain best models on full training data
+if best_clf_name in ['SVM', 'MLP']:
+    best_clf = clf_models[best_clf_name]
+    best_clf.fit(scaler_lulc.transform(X_lulc), y_lulc)
+else:
+    best_clf = clf_models[best_clf_name]
+    best_clf.fit(X_lulc, y_lulc)
+
+if best_reg_name in ['SVR', 'MLP']:
+    best_reg = reg_models[best_reg_name]
+    best_reg.fit(scaler_lst.transform(X_lst), y_lst)
+else:
+    best_reg = reg_models[best_reg_name]
+    best_reg.fit(X_lst, y_lst)
+
+# Save the best models
+joblib.dump(best_clf, os.path.join(OUTPUT_DIR, f'best_clf_{best_clf_name}.joblib'))
+joblib.dump(best_reg, os.path.join(OUTPUT_DIR, f'best_reg_{best_reg_name}.joblib'))
+
+
+# Save predictions for 2025 back to dataframe and excel
+
+# Predict for all data points
+if best_clf_name in ['SVM', 'MLP']:
+    pred_lulc_2025 = best_clf.predict(scaler_lulc.transform(X_lulc))
+else:
+    pred_lulc_2025 = best_clf.predict(X_lulc)
+
+if best_reg_name in ['SVR', 'MLP']:
+    pred_lst_2025 = best_reg.predict(scaler_lst.transform(X_lst))
+else:
+    pred_lst_2025 = best_reg.predict(X_lst)
+
+# Create a results dataframe with FIDs and predictions
+results_df = pd.DataFrame({
+    'FID': fid_lulc,
+    'pred_lulc_2025_best': pred_lulc_2025,
+    'pred_lst_2025_best': pred_lst_2025
+})
+
+# Merge with original data
+df = df.merge(results_df, on='FID', how='left')
+
+# Save to excel
+out_excel = os.path.join(OUTPUT_DIR, 'Prediction_results_2025_and_models.xlsx')
+df.to_excel(out_excel, index=False)
+print('Saved prediction results to', out_excel)
+
+
+# Detailed evaluation with classification report and regression metrics
+
+print(f'\nClassification report for best classifier: {best_clf_name}')
+print(classification_report(y_lulc, pred_lulc_2025))
+plot_confusion_matrix(y_lulc, pred_lulc_2025, classes=[0,1,2,3],
+                     title=f'Confusion Matrix - Best ({best_clf_name})', fname='confmat_best_clf.png')
+
+print(f'\nRegression metrics for best regressor: {best_reg_name}')
+rmse = mean_squared_error(y_lst, pred_lst_2025)
+mae = mean_absolute_error(y_lst, pred_lst_2025)
+r2 = r2_score(y_lst, pred_lst_2025)
+print(f'RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}')
+plot_regression_results(y_lst, pred_lst_2025, f'Actual vs Predicted LST - Best ({best_reg_name})',
+                       fname='reg_scatter_best.png')
+
+
+# Forecast future years (2029, 2033, 2037) using iterative prediction
+
+future_years = [2029, 2033, 2037]
+
+# Create a working copy of the data
+work = df.copy()
+
+# For each FID, we'll use the time series to predict future values
+def predict_future_lulc_lst(fid_data, clf_model, reg_model, clf_scaler, reg_scaler, future_years):
+    """Predict LULC and LST for future years for a single FID"""
+    lulc_predictions = {}
+    lst_predictions = {}
+
+    # Get the historical data for this FID
+    historical_lulc = [fid_data[f'lulc_{y}'].iloc[0] for y in [2005, 2009, 2013, 2017, 2021, 2025]]
+    historical_lst = [fid_data[f'lst_{y}'].iloc[0] for y in [2005, 2009, 2013, 2017, 2021, 2025]]
+
+    # For each future year, use the most recent 5 years to predict the next
+    for year in future_years:
+        # Use the last 5 available years
+        recent_lulc = historical_lulc[-5:]
+        recent_lst = historical_lst[-5:]
+
+        # Prepare features
+        lulc_features = np.array(recent_lulc).reshape(1, -1)
+        lst_features = np.array(recent_lst).reshape(1, -1)
+
+        # Predict LULC
+        if best_clf_name in ['SVM', 'MLP']:
+            lulc_features_scaled = clf_scaler.transform(lulc_features)
+            lulc_pred = clf_model.predict(lulc_features_scaled)[0]
+        else:
+            lulc_pred = clf_model.predict(lulc_features)[0]
+
+        # Predict LST
+        if best_reg_name in ['SVR', 'MLP']:
+            lst_features_scaled = reg_scaler.transform(lst_features)
+            lst_pred = reg_model.predict(lst_features_scaled)[0]
+        else:
+            lst_pred = reg_model.predict(lst_features)[0]
+
+
+        # Store predictions
+        lulc_predictions[year] = lulc_pred
+        lst_predictions[year] = lst_pred
+
+        # Add to historical data for next prediction
+        historical_lulc.append(lulc_pred)
+        historical_lst.append(lst_pred)
+
+    return lulc_predictions, lst_predictions
+
+# Predict for each FID
+for fid in work['FID'].unique():
+    fid_data = work[work['FID'] == fid]
+    lulc_preds, lst_preds = predict_future_lulc_lst(
+        fid_data, best_clf, best_reg, scaler_lulc, scaler_lst, future_years
+    )
+
+    # Add predictions to dataframe
+    for year in future_years:
+        work.loc[work['FID'] == fid, f'pred_lulc_{year}'] = lulc_preds[year]
+        work.loc[work['FID'] == fid, f'pred_lst_{year}'] = lst_preds[year]
+
+# Save forecasted results
+forecast_out = os.path.join(OUTPUT_DIR, 'Forecast_future_years.xlsx')
+work.to_excel(forecast_out, index=False)
+print('Saved future forecasts to', forecast_out)
+
+
+# Extra plots: spatial distribution example (requires coordinates) - if user has X,Y add them
+
+if 'X' in df.columns and 'Y' in df.columns:
+    print('\nPlotting spatial map of predicted LST (2029) if coordinates exist..')
+    plt.figure(figsize=(8,6))
+    sc = plt.scatter(work['X'], work['Y'], c=work['pred_lst_2029'], s=6)
+    plt.colorbar(sc, label='Pred LST 2029 (°C)')
+    plt.title('Spatial distribution of predicted LST (2029)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, 'spatial_pred_lst_2029.png'))
+    plt.show()
+
+
+# Print summary and instructions for the user
+
+print('\nSUMMARY:')
+print(f' - Best classifier: {best_clf_name} (saved in {OUTPUT_DIR})')
+print(f' - Best regressor: {best_reg_name} (saved in {OUTPUT_DIR})')
+print(' - Results and plots saved in folder:', OUTPUT_DIR)
+print('\nNext steps / suggestions:')
+print(' - If you want stricter evaluation, perform k-fold CV on the training period (2005-2021) or with a time-series split.')
+print(' - You can tune hyperparameters with GridSearchCV for each model (careful: computationally expensive).')
+print(' - For classification, consider balancing classes if they are imbalanced (SMOTE or class weights).')
+print('\nEnd of script.')
